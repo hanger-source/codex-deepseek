@@ -1,0 +1,85 @@
+diff --git a/internal/runtime/executor/claude_executor.go b/internal/runtime/executor/claude_executor.go
+index eb17864d..3cb47cb0 100644
+--- a/internal/runtime/executor/claude_executor.go
++++ b/internal/runtime/executor/claude_executor.go
+@@ -9,6 +9,7 @@ import (
+ 	"crypto/sha256"
+ 	"encoding/hex"
+ 	"fmt"
++	"os"
+ 	"io"
+ 	"net/http"
+ 	"strings"
+@@ -376,6 +377,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
+ 	}
+ 
+ 	url := fmt.Sprintf("%s/v1/messages?beta=true", baseURL)
++	os.MkdirAll("/Users/hanger/.codex-proxy/debug", 0755); _ = os.WriteFile("/Users/hanger/.codex-proxy/debug/claude-payload.json", bodyForUpstream, 0644)
+ 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyForUpstream))
+ 	if err != nil {
+ 		return nil, err
+@@ -484,9 +486,16 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
+ 		// For other formats, use translation
+ 		scanner := bufio.NewScanner(decodedBody)
+ 		scanner.Buffer(nil, 52_428_800) // 50MB
++		streamFile, _ := os.Create("/Users/hanger/.codex-proxy/debug/stream.log")
++		defer func() { if streamFile != nil { streamFile.Close() } }()
+ 		var param any
+ 		for scanner.Scan() {
+ 			line := scanner.Bytes()
++			if streamFile != nil { streamFile.Write(line); streamFile.Write([]byte("\n")) }
++			if bytes.Contains(line, []byte(`"usage"`)) && (bytes.Contains(line, []byte(`"message_start"`)) || bytes.Contains(line, []byte(`"message_delta"`))) {
++				f, _ := os.OpenFile("/Users/hanger/.codex-proxy/debug/usage.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
++				if f != nil { f.Write([]byte(time.Now().Format("15:04:05") + " ")); f.Write(line); f.Write([]byte("\n")); f.Close() }
++			}
+ 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+ 			if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
+ 				reporter.Publish(ctx, detail)
+diff --git a/internal/translator/claude/openai/responses/claude_openai-responses_request.go b/internal/translator/claude/openai/responses/claude_openai-responses_request.go
+index fb79a5bb..ee4dbba0 100644
+--- a/internal/translator/claude/openai/responses/claude_openai-responses_request.go
++++ b/internal/translator/claude/openai/responses/claude_openai-responses_request.go
+@@ -6,6 +6,7 @@ import (
+ 	"encoding/hex"
+ 	"fmt"
+ 	"math/big"
++	"os"
+ 	"strings"
+ 
+ 	"github.com/google/uuid"
+@@ -33,6 +34,7 @@ var (
+ // - stream passthrough via parameter
+ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte, stream bool) []byte {
+ 	rawJSON := inputRawJSON
++	_ = os.WriteFile("/Users/hanger/.codex-proxy/debug/raw-input.json", rawJSON, 0644)
+ 
+ 	if account == "" {
+ 		u, _ := uuid.NewRandom()
+@@ -472,6 +474,27 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
+ 		}
+ 	}
+ 
++	// Debug
++	var dbg []byte
++	msgsD := gjson.GetBytes(out, "messages")
++	if msgsD.IsArray() {
++		dbg = append(dbg, []byte(fmt.Sprintf("total_messages:%d\n", len(msgsD.Array())))...)
++		for i, m := range msgsD.Array() {
++			role := m.Get("role").String()
++			var types []string
++			m.Get("content").ForEach(func(_, cc gjson.Result) bool { types = append(types, cc.Get("type").String()); return true })
++			dbg = append(dbg, []byte(fmt.Sprintf("  [%d] role=%s types=%v\n", i, role, types))...)
++		}
++	}
++	_ = os.WriteFile("/Users/hanger/.codex-proxy/debug/msg-order.log", dbg, 0644)
++	var hashes []byte
++	msgsD.ForEach(func(idx gjson.Result, m gjson.Result) bool {
++		h := fmt.Sprintf("%x", sha256.Sum256([]byte(m.Raw)))[:12]
++		hashes = append(hashes, []byte(fmt.Sprintf("%d %s\n", idx.Int(), h))...)
++		return true
++	})
++	_ = os.WriteFile("/Users/hanger/.codex-proxy/debug/msg-hashes.txt", hashes, 0644)
++
+ 	return out
+ }
+ 
