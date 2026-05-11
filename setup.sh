@@ -165,8 +165,8 @@ echo "  ✓ 配置已写入 $CONFIG"
 # 4. 配置 Codex
 mkdir -p "$HOME/.codex"
 if [[ -f "$HOME/.codex/config.toml" ]]; then
-  cp "$HOME/.codex/config.toml" "$HOME/.codex/config.toml.bak"
-  echo "  ✓ 已备份原配置到 ~/.codex/config.toml.bak"
+  cp "$HOME/.codex/config.toml" "$HOME/.codex/config.toml.bak.$(date +%Y%m%d%H%M%S)"
+  echo "  ✓ 已备份原配置到 ~/.codex/config.toml.bak.<timestamp>"
 fi
 cat > "$HOME/.codex/config.toml" << EOF
 model_provider = "deepseek-proxy"
