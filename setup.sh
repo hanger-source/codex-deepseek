@@ -8,10 +8,10 @@ BIN="$BIN_DIR/cli-proxy-api"
 CONFIG="$PROXY_DIR/config.yaml"
 PATCH="$PROXY_DIR/deepseek-anthropic-fix.patch"
 
-# 复制patch到工作目录
+# 下载patch
 if [[ ! -f "$PATCH" ]]; then
-  SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-  cp "$SCRIPT_DIR/deepseek-anthropic-fix.patch" "$PATCH"
+  mkdir -p "$PROXY_DIR"
+  curl -sL "https://raw.githubusercontent.com/hanger-source/codex-deepseek/main/deepseek-anthropic-fix.patch" -o "$PATCH"
 fi
 PORT=15721
 
