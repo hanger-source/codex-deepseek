@@ -1,5 +1,5 @@
 diff --git a/internal/translator/claude/openai/responses/claude_openai-responses_request.go b/internal/translator/claude/openai/responses/claude_openai-responses_request.go
-index 1398749..fb79a5b 100644
+index 13987495..fb79a5bb 100644
 --- a/internal/translator/claude/openai/responses/claude_openai-responses_request.go
 +++ b/internal/translator/claude/openai/responses/claude_openai-responses_request.go
 @@ -167,7 +167,76 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
@@ -388,7 +388,7 @@ index 1398749..fb79a5b 100644
  }
 +
 diff --git a/internal/translator/openai/openai/responses/openai_openai-responses_request.go b/internal/translator/openai/openai/responses/openai_openai-responses_request.go
-index 15acf7c..b7a0e3f 100644
+index 15acf7cd..b7a0e3f0 100644
 --- a/internal/translator/openai/openai/responses/openai_openai-responses_request.go
 +++ b/internal/translator/openai/openai/responses/openai_openai-responses_request.go
 @@ -59,6 +59,7 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
