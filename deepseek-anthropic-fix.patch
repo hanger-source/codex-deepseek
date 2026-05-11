@@ -1,57 +1,31 @@
 diff --git a/internal/translator/claude/openai/responses/claude_openai-responses_request.go b/internal/translator/claude/openai/responses/claude_openai-responses_request.go
-index 13987495..fb79a5bb 100644
+index 13987495..59478cbd 100644
 --- a/internal/translator/claude/openai/responses/claude_openai-responses_request.go
 +++ b/internal/translator/claude/openai/responses/claude_openai-responses_request.go
-@@ -167,7 +167,76 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
+@@ -167,7 +167,74 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
  		}
  	}
  
 +
  	// input array processing
-+	// Strategy: build messages in a single pass with no post-processing reordering.
-+	// - pendingThinking: holds thinking text for next assistant message
-+	// - pendingAssistantParts: accumulates text parts from assistant messages
-+	// - When function_call arrives, flush pending into one assistant msg [thinking, text..., tool_use...]
-+	// - Consecutive function_calls merge into same assistant
-+	// - Consecutive function_call_outputs merge into same user msg
-+	// - Developer messages between tool_use and tool_result merge into tool_result user msg
++	// Design: single-pass, no reordering, direct output.
++	// - assistant messages output immediately with thinking block
++	// - consecutive function_calls buffer into one assistant
++	// - consecutive function_call_outputs buffer into one user
++	// - reasoning updates pendingThinking for next assistant
++	// - developer messages between tool_use/tool_result defer into tool_result
 +	var pendingThinking string
-+	var pendingAssistantParts []string // text parts from assistant messages before tool_use
-+	var pendingToolUses [][]byte
-+	var pendingToolResults [][]byte
-+	var deferredUserParts []string // developer/user messages between tool_use and tool_result
++	var pendingFuncCalls [][]byte      // buffered tool_use blocks
++	var pendingFuncResults [][]byte    // buffered tool_result blocks
++	var deferredTexts []string         // developer/user texts deferred during waitingForToolResult
 +	waitingForToolResult := false
 +
-+	flushToolResults := func() {
-+		if len(pendingToolResults) == 0 {
-+			return
-+		}
-+		usr := []byte(`{"role":"user","content":[]}`)
-+		for _, tr := range pendingToolResults {
-+			usr, _ = sjson.SetRawBytes(usr, "content.-1", tr)
-+		}
-+		// Append any deferred user/developer messages as text
-+		for _, txt := range deferredUserParts {
-+			part := []byte(`{"type":"text","text":""}`)
-+			part, _ = sjson.SetBytes(part, "text", txt)
-+			usr, _ = sjson.SetRawBytes(usr, "content.-1", part)
-+		}
-+		pendingToolResults = nil
-+		deferredUserParts = nil
-+		out, _ = sjson.SetRawBytes(out, "messages.-1", usr)
-+		waitingForToolResult = false
-+	}
 +
-+	flushAssistant := func() {
-+		if len(pendingToolUses) == 0 && len(pendingAssistantParts) == 0 {
++	emitAssistantToolUse := func() {
++		if len(pendingFuncCalls) == 0 {
 +			return
-+		}
-+		// Flush any pending tool results first to maintain correct ordering
-+		if len(pendingToolResults) > 0 {
-+			flushToolResults()
 +		}
 +		asst := []byte(`{"role":"assistant","content":[]}`)
-+		// One thinking block
 +		thinkBlock := []byte(`{"type":"thinking","thinking":""}`)
 +		if pendingThinking != "" {
 +			thinkBlock, _ = sjson.SetBytes(thinkBlock, "thinking", pendingThinking)
@@ -60,57 +34,66 @@ index 13987495..fb79a5bb 100644
 +		}
 +		asst, _ = sjson.SetRawBytes(asst, "content.-1", thinkBlock)
 +		pendingThinking = ""
-+		// Text parts
-+		for _, p := range pendingAssistantParts {
-+			asst, _ = sjson.SetRawBytes(asst, "content.-1", []byte(p))
++		for _, fc := range pendingFuncCalls {
++			asst, _ = sjson.SetRawBytes(asst, "content.-1", fc)
 +		}
-+		pendingAssistantParts = nil
-+		// Tool uses
-+		for _, tu := range pendingToolUses {
-+			asst, _ = sjson.SetRawBytes(asst, "content.-1", tu)
++		pendingFuncCalls = nil
++		// If last message is already assistant, merge tool_use into it
++		msgsArr := gjson.GetBytes(out, "messages")
++		lastIdx := int(msgsArr.Get("#").Int()) - 1
++		if lastIdx >= 0 && msgsArr.Array()[lastIdx].Get("role").String() == "assistant" {
++			// Append tool_use blocks to existing assistant
++			gjson.GetBytes(asst, "content").ForEach(func(_, item gjson.Result) bool {
++				if item.Get("type").String() != "thinking" {
++					out, _ = sjson.SetRawBytes(out, fmt.Sprintf("messages.%d.content.-1", lastIdx), []byte(item.Raw))
++				}
++				return true
++			})
++		} else {
++			out, _ = sjson.SetRawBytes(out, "messages.-1", asst)
 +		}
-+		pendingToolUses = nil
-+		out, _ = sjson.SetRawBytes(out, "messages.-1", asst)
 +		waitingForToolResult = true
 +	}
 +
-+
++	emitToolResults := func() {
++		if len(pendingFuncResults) == 0 {
++			return
++		}
++		usr := []byte(`{"role":"user","content":[]}`)
++		for _, tr := range pendingFuncResults {
++			usr, _ = sjson.SetRawBytes(usr, "content.-1", tr)
++		}
++		for _, txt := range deferredTexts {
++			part := []byte(`{"type":"text","text":""}`)
++			part, _ = sjson.SetBytes(part, "text", txt)
++			usr, _ = sjson.SetRawBytes(usr, "content.-1", part)
++		}
++		pendingFuncResults = nil
++		deferredTexts = nil
++		out, _ = sjson.SetRawBytes(out, "messages.-1", usr)
++		waitingForToolResult = false
++	}
 +
  	if input := root.Get("input"); input.Exists() && input.IsArray() {
  		input.ForEach(func(_, item gjson.Result) bool {
  			if extractedFromSystem && strings.EqualFold(item.Get("role").String(), "system") {
-@@ -177,138 +246,123 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
+@@ -177,166 +244,140 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
  			if typ == "" && item.Get("role").String() != "" {
  				typ = "message"
  			}
 +
-+			// Flush pending tool calls and results before processing non-tool items
++			// Before non-function items, flush any pending function state
 +			if typ != "function_call" && typ != "function_call_output" {
-+				if len(pendingToolUses) > 0 {
-+					flushAssistant()
++				if len(pendingFuncCalls) > 0 {
++					emitAssistantToolUse()
 +				}
-+				if len(pendingToolResults) > 0 {
-+					flushToolResults()
++				if len(pendingFuncResults) > 0 {
++					emitToolResults()
 +				}
 +			}
 +
  			switch typ {
-+			case "reasoning":
-+				pendingThinking = " "
-+				if summary := item.Get("summary"); summary.IsArray() {
-+					var text string
-+					summary.ForEach(func(_, s gjson.Result) bool {
-+						if s.Get("type").String() == "summary_text" {
-+							text += s.Get("text").String()
-+						}
-+						return true
-+					})
-+					if text != "" {
-+						pendingThinking = text
-+					}
-+				}
-+
- 			case "message":
+-			case "message":
 -				// Determine role and construct Claude-compatible content parts.
 -				var role string
 -				var textAggregate strings.Builder
@@ -118,28 +101,10 @@ index 13987495..fb79a5bb 100644
 -				hasImage := false
 -				hasFile := false
 -				if parts := item.Get("content"); parts.Exists() && parts.IsArray() {
-+				role := item.Get("role").String()
-+				if role == "" {
-+					if parts := item.Get("content"); parts.IsArray() {
-+						parts.ForEach(func(_, p gjson.Result) bool {
-+							if p.Get("type").String() == "output_text" {
-+								role = "assistant"
-+							} else if p.Get("type").String() == "input_text" {
-+								role = "user"
-+							}
-+							return role == ""
-+						})
-+					}
-+				}
-+
-+				// Extract text content
-+				var textParts []string
-+				var imageParts []string
-+				if parts := item.Get("content"); parts.IsArray() {
- 					parts.ForEach(func(_, part gjson.Result) bool {
- 						ptype := part.Get("type").String()
- 						switch ptype {
- 						case "input_text", "output_text":
+-					parts.ForEach(func(_, part gjson.Result) bool {
+-						ptype := part.Get("type").String()
+-						switch ptype {
+-						case "input_text", "output_text":
 -							if t := part.Get("text"); t.Exists() {
 -								txt := t.String()
 -								textAggregate.WriteString(txt)
@@ -151,17 +116,13 @@ index 13987495..fb79a5bb 100644
 -								role = "user"
 -							} else {
 -								role = "assistant"
-+							if t := part.Get("text"); t.Exists() && t.String() != "" {
-+								p := []byte(`{"type":"text","text":""}`)
-+								p, _ = sjson.SetBytes(p, "text", t.String())
-+								textParts = append(textParts, string(p))
- 							}
- 						case "input_image":
- 							url := part.Get("image_url").String()
+-							}
+-						case "input_image":
+-							url := part.Get("image_url").String()
 -							if url == "" {
 -								url = part.Get("url").String()
 -							}
- 							if url != "" {
+-							if url != "" {
 -								var contentPart []byte
 -								if strings.HasPrefix(url, "data:") {
 -									trimmed := strings.TrimPrefix(url, "data:")
@@ -214,49 +175,59 @@ index 13987495..fb79a5bb 100644
 -									role = "user"
 -								}
 -								hasFile = true
-+								p := []byte(`{"type":"image","source":{"type":"url","url":""}}`)
-+								p, _ = sjson.SetBytes(p, "source.url", url)
-+								imageParts = append(imageParts, string(p))
- 							}
+-							}
++			case "reasoning":
++				pendingThinking = " "
++				if summary := item.Get("summary"); summary.IsArray() {
++					var text string
++					summary.ForEach(func(_, s gjson.Result) bool {
++						if s.Get("type").String() == "summary_text" {
++							text += s.Get("text").String()
  						}
  						return true
  					})
 -				} else if parts.Type == gjson.String {
 -					textAggregate.WriteString(parts.String())
-+				} else if parts.Type == gjson.String && parts.String() != "" {
-+					p := []byte(`{"type":"text","text":""}`)
-+					p, _ = sjson.SetBytes(p, "text", parts.String())
-+					textParts = append(textParts, string(p))
++					if text != "" {
++						pendingThinking = text
++					}
  				}
  
 -				// Fallback to given role if content types not decisive
--				if role == "" {
++			case "message":
++				role := item.Get("role").String()
++				// Determine role from content types if not explicit
+ 				if role == "" {
 -					r := item.Get("role").String()
 -					switch r {
 -					case "user", "assistant", "system":
 -						role = r
 -					default:
 -						role = "user"
-+				if role == "assistant" {
-+					// Accumulate assistant text, will be flushed with next tool_use
-+					pendingAssistantParts = append(pendingAssistantParts, textParts...)
-+				} else if role == "developer" || role == "system" {
-+					if waitingForToolResult {
-+						// Defer until tool_result
-+						for _, p := range textParts {
-+							deferredUserParts = append(deferredUserParts, gjson.Get(p, "text").String())
-+						}
-+					} else {
-+						msg := []byte(`{"role":"user","content":""}`)
-+						var allText string
-+						for _, p := range textParts {
-+							allText += gjson.Get(p, "text").String()
-+						}
-+						msg, _ = sjson.SetBytes(msg, "content", allText)
-+						out, _ = sjson.SetRawBytes(out, "messages.-1", msg)
++					if parts := item.Get("content"); parts.IsArray() {
++						parts.ForEach(func(_, p gjson.Result) bool {
++							if p.Get("type").String() == "output_text" { role = "assistant" }
++							if p.Get("type").String() == "input_text" { role = "user" }
++							return role == ""
++						})
  					}
--				}
--
++					if role == "" { role = "user" }
++				}
++
++				// Extract text
++				var textContent string
++				if parts := item.Get("content"); parts.IsArray() {
++					parts.ForEach(func(_, part gjson.Result) bool {
++						switch part.Get("type").String() {
++						case "input_text", "output_text":
++							textContent += part.Get("text").String()
++						}
++						return true
++					})
++				} else if parts.Type == gjson.String {
++					textContent = parts.String()
+ 				}
+ 
 -				if len(partsJSON) > 0 {
 -					msg := []byte(`{"role":"","content":[]}`)
 -					msg, _ = sjson.SetBytes(msg, "role", role)
@@ -265,26 +236,48 @@ index 13987495..fb79a5bb 100644
 -						msg, _ = sjson.DeleteBytes(msg, "content")
 -						textPart := gjson.Parse(partsJSON[0])
 -						msg, _ = sjson.SetBytes(msg, "content", textPart.Get("text").String())
-+				} else {
-+					// user message
-+					if waitingForToolResult {
-+						for _, p := range textParts {
-+							deferredUserParts = append(deferredUserParts, gjson.Get(p, "text").String())
++				if role == "assistant" {
++					// Check if last message is also assistant — merge into it
++					msgsArr := gjson.GetBytes(out, "messages")
++					lastIdx := int(msgsArr.Get("#").Int()) - 1
++					if lastIdx >= 0 && msgsArr.Array()[lastIdx].Get("role").String() == "assistant" {
++						// Merge: append text to existing assistant's content
++						if textContent != "" {
++							textPart := []byte(`{"type":"text","text":""}`)
++							textPart, _ = sjson.SetBytes(textPart, "text", textContent)
++							out, _ = sjson.SetRawBytes(out, "messages."+fmt.Sprintf("%d", lastIdx)+".content.-1", textPart)
 +						}
  					} else {
 -						for _, partJSON := range partsJSON {
 -							msg, _ = sjson.SetRawBytes(msg, "content.-1", []byte(partJSON))
-+						flushToolResults() // flush any pending
-+						if len(textParts) > 0 || len(imageParts) > 0 {
-+							msg := []byte(`{"role":"user","content":[]}`)
-+							for _, p := range textParts {
-+								msg, _ = sjson.SetRawBytes(msg, "content.-1", []byte(p))
-+							}
-+							for _, p := range imageParts {
-+								msg, _ = sjson.SetRawBytes(msg, "content.-1", []byte(p))
-+							}
-+							out, _ = sjson.SetRawBytes(out, "messages.-1", msg)
++						// New assistant message with thinking
++						asst := []byte(`{"role":"assistant","content":[]}`)
++						thinkBlock := []byte(`{"type":"thinking","thinking":""}`)
++						if pendingThinking != "" {
++							thinkBlock, _ = sjson.SetBytes(thinkBlock, "thinking", pendingThinking)
++						} else {
++							thinkBlock, _ = sjson.SetBytes(thinkBlock, "thinking", " ")
  						}
++						asst, _ = sjson.SetRawBytes(asst, "content.-1", thinkBlock)
++						pendingThinking = ""
++						if textContent != "" {
++							textPart := []byte(`{"type":"text","text":""}`)
++							textPart, _ = sjson.SetBytes(textPart, "text", textContent)
++							asst, _ = sjson.SetRawBytes(asst, "content.-1", textPart)
++						}
++						out, _ = sjson.SetRawBytes(out, "messages.-1", asst)
++					}
++				} else {
++					// user/developer/system message
++					if waitingForToolResult {
++						// Defer text until tool_result is emitted
++						if textContent != "" {
++							deferredTexts = append(deferredTexts, textContent)
++						}
++					} else if textContent != "" {
++						msg := []byte(`{"role":"user","content":""}`)
++						msg, _ = sjson.SetBytes(msg, "content", textContent)
++						out, _ = sjson.SetRawBytes(out, "messages.-1", msg)
  					}
 -					out, _ = sjson.SetRawBytes(out, "messages.-1", msg)
 -				} else if textAggregate.Len() > 0 || role == "system" {
@@ -297,16 +290,20 @@ index 13987495..fb79a5bb 100644
  			case "function_call":
 -				// Map to assistant tool_use
  				callID := item.Get("call_id").String()
- 				if callID == "" {
- 					callID = genToolCallID()
- 				}
+-				if callID == "" {
+-					callID = genToolCallID()
+-				}
++				if callID == "" { callID = genToolCallID() }
  				name := item.Get("name").String()
  				argsStr := item.Get("arguments").String()
 -
  				toolUse := []byte(`{"type":"tool_use","id":"","name":"","input":{}}`)
  				toolUse, _ = sjson.SetBytes(toolUse, "id", callID)
  				toolUse, _ = sjson.SetBytes(toolUse, "name", name)
-@@ -318,25 +372,48 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
+ 				if argsStr != "" && gjson.Valid(argsStr) {
+-					argsJSON := gjson.Parse(argsStr)
+-					if argsJSON.IsObject() {
++					if argsJSON := gjson.Parse(argsStr); argsJSON.IsObject() {
  						toolUse, _ = sjson.SetRawBytes(toolUse, "input", []byte(argsJSON.Raw))
  					}
  				}
@@ -314,12 +311,14 @@ index 13987495..fb79a5bb 100644
 -				asst := []byte(`{"role":"assistant","content":[]}`)
 -				asst, _ = sjson.SetRawBytes(asst, "content.-1", toolUse)
 -				out, _ = sjson.SetRawBytes(out, "messages.-1", asst)
-+				pendingToolUses = append(pendingToolUses, toolUse)
++				pendingFuncCalls = append(pendingFuncCalls, toolUse)
  
  			case "function_call_output":
 -				// Map to user tool_result
-+				// First flush the assistant message if not yet flushed
-+				flushAssistant()
++				// Flush function calls first if not yet emitted
++				if len(pendingFuncCalls) > 0 {
++					emitAssistantToolUse()
++				}
  				callID := item.Get("call_id").String()
  				outputStr := item.Get("output").String()
  				toolResult := []byte(`{"type":"tool_result","tool_use_id":"","content":""}`)
@@ -329,34 +328,13 @@ index 13987495..fb79a5bb 100644
 -				usr := []byte(`{"role":"user","content":[]}`)
 -				usr, _ = sjson.SetRawBytes(usr, "content.-1", toolResult)
 -				out, _ = sjson.SetRawBytes(out, "messages.-1", usr)
-+				pendingToolResults = append(pendingToolResults, toolResult)
++				pendingFuncResults = append(pendingFuncResults, toolResult)
  			}
  			return true
  		})
 +		// Flush remaining
-+		if len(pendingToolUses) > 0 {
-+			flushAssistant()
-+		}
-+		if len(pendingToolResults) > 0 {
-+			flushToolResults()
-+		}
-+		// If there are pending assistant parts without tool_use (pure text response)
-+		if len(pendingAssistantParts) > 0 {
-+			asst := []byte(`{"role":"assistant","content":[]}`)
-+			thinkBlock := []byte(`{"type":"thinking","thinking":""}`)
-+			if pendingThinking != "" {
-+				thinkBlock, _ = sjson.SetBytes(thinkBlock, "thinking", pendingThinking)
-+			} else {
-+				thinkBlock, _ = sjson.SetBytes(thinkBlock, "thinking", " ")
-+			}
-+			asst, _ = sjson.SetRawBytes(asst, "content.-1", thinkBlock)
-+			for _, p := range pendingAssistantParts {
-+				asst, _ = sjson.SetRawBytes(asst, "content.-1", []byte(p))
-+			}
-+			out, _ = sjson.SetRawBytes(out, "messages.-1", asst)
-+			pendingAssistantParts = nil
-+			pendingThinking = ""
-+		}
++		if len(pendingFuncCalls) > 0 { emitAssistantToolUse() }
++		if len(pendingFuncResults) > 0 { emitToolResults() }
 +	} else if input.Type == gjson.String {
 +		msg := []byte(`{"role":"user","content":""}`)
 +		msg, _ = sjson.SetBytes(msg, "content", input.String())
@@ -364,7 +342,7 @@ index 13987495..fb79a5bb 100644
  	}
  
  	includedToolNames := map[string]struct{}{}
-@@ -467,9 +544,7 @@ func convertResponsesFunctionToolToClaude(tool gjson.Result, overrideName string
+@@ -467,9 +508,7 @@ func convertResponsesFunctionToolToClaude(tool gjson.Result, overrideName string
  }
  
  func convertResponsesWebSearchToolToClaude(tool gjson.Result) ([]byte, bool) {
@@ -375,7 +353,7 @@ index 13987495..fb79a5bb 100644
  
  	name := strings.TrimSpace(tool.Get("name").String())
  	if name == "" {
-@@ -555,9 +630,10 @@ func qualifyResponsesNamespaceToolName(namespaceName, childName string) string {
+@@ -555,9 +594,10 @@ func qualifyResponsesNamespaceToolName(namespaceName, childName string) string {
  
  func isUnsupportedOpenAIBuiltinToolType(toolType string) bool {
  	switch toolType {
@@ -387,6 +365,147 @@ index 13987495..fb79a5bb 100644
  	}
  }
 +
+diff --git a/internal/translator/claude/openai/responses/deepseek_cases_test.go b/internal/translator/claude/openai/responses/deepseek_cases_test.go
+new file mode 100644
+index 00000000..a49c7731
+--- /dev/null
++++ b/internal/translator/claude/openai/responses/deepseek_cases_test.go
+@@ -0,0 +1,135 @@
++package responses
++
++import (
++	"encoding/json"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/tidwall/gjson"
++)
++
++type testCase struct {
++	Name  string            `json:"name"`
++	Input []json.RawMessage `json:"input"`
++}
++
++func TestDeepSeekCases(t *testing.T) {
++	casesDir := "/Users/hanger/third-party/CLIProxyAPI/test/deepseek/cases"
++	files, err := filepath.Glob(filepath.Join(casesDir, "*.json"))
++	if err != nil || len(files) == 0 {
++		t.Fatalf("no test cases found in %s", casesDir)
++	}
++
++	for _, f := range files {
++		data, err := os.ReadFile(f)
++		if err != nil {
++			t.Fatalf("read %s: %v", f, err)
++		}
++		var tc testCase
++		if err := json.Unmarshal(data, &tc); err != nil {
++			t.Fatalf("parse %s: %v", f, err)
++		}
++
++		t.Run(tc.Name, func(t *testing.T) {
++			// Build full request JSON
++			inputJSON, _ := json.Marshal(tc.Input)
++			reqJSON := []byte(`{"model":"test","input":` + string(inputJSON) + `}`)
++
++			out := ConvertOpenAIResponsesRequestToClaude("test-model", reqJSON, false)
++			msgs := gjson.GetBytes(out, "messages")
++			if !msgs.IsArray() {
++				t.Fatal("messages is not array")
++			}
++
++			arr := msgs.Array()
++			var prevRole string
++
++			for i, m := range arr {
++				role := m.Get("role").String()
++				content := m.Get("content")
++
++				// Rule 1: no consecutive assistant
++				if role == "assistant" && prevRole == "assistant" {
++					t.Errorf("[%d] consecutive assistant messages", i)
++				}
++
++				if role == "assistant" {
++					if !content.IsArray() {
++						t.Errorf("[%d] assistant content not array", i)
++						prevRole = role
++						continue
++					}
++					cArr := content.Array()
++
++					// Rule 2: exactly one thinking block at position 0
++					thinkCount := 0
++					for j, c := range cArr {
++						if c.Get("type").String() == "thinking" {
++							thinkCount++
++							if j != 0 {
++								t.Errorf("[%d] thinking at position %d, want 0", i, j)
++							}
++						}
++					}
++					if thinkCount != 1 {
++						t.Errorf("[%d] thinking count=%d, want 1", i, thinkCount)
++					}
++
++					// Rule 3: tool_use followed by user(tool_result)
++					var tuIDs []string
++					for _, c := range cArr {
++						if c.Get("type").String() == "tool_use" {
++							tuIDs = append(tuIDs, c.Get("id").String())
++						}
++					}
++					if len(tuIDs) > 0 && i+1 < len(arr) {
++						next := arr[i+1]
++						if next.Get("role").String() != "user" {
++							t.Errorf("[%d] tool_use followed by %s, want user", i, next.Get("role").String())
++						} else if next.Get("content").IsArray() {
++							var trIDs []string
++							next.Get("content").ForEach(func(_, c gjson.Result) bool {
++								if c.Get("type").String() == "tool_result" {
++									trIDs = append(trIDs, c.Get("tool_use_id").String())
++								}
++								return true
++							})
++							for _, id := range tuIDs {
++								found := false
++								for _, tr := range trIDs {
++									if tr == id {
++										found = true
++										break
++									}
++								}
++								if !found {
++									t.Errorf("[%d] tool_use id=%s has no matching tool_result", i, id)
++								}
++							}
++						}
++					}
++				}
++				prevRole = role
++			}
++
++			// Rule 4: no assistant text lost
++			for _, item := range tc.Input {
++				var parsed map[string]interface{}
++				json.Unmarshal(item, &parsed)
++				if parsed["type"] == "message" && parsed["role"] == "assistant" {
++					if content, ok := parsed["content"].([]interface{}); ok && len(content) > 0 {
++						if first, ok := content[0].(map[string]interface{}); ok {
++							if text, ok := first["text"].(string); ok && text != "" {
++								if !strings.Contains(string(out), text) {
++									t.Errorf("assistant text %q lost in translation", text)
++								}
++							}
++						}
++					}
++				}
++			}
++		})
++	}
++}
 diff --git a/internal/translator/openai/openai/responses/openai_openai-responses_request.go b/internal/translator/openai/openai/responses/openai_openai-responses_request.go
 index 15acf7cd..b7a0e3f0 100644
 --- a/internal/translator/openai/openai/responses/openai_openai-responses_request.go
@@ -450,3 +569,195 @@ index 15acf7cd..b7a0e3f0 100644
  				appendRegularMessage(message)
  
  			case "function_call":
+diff --git a/test/deepseek/cases/01_basic_chat.json b/test/deepseek/cases/01_basic_chat.json
+new file mode 100644
+index 00000000..83db552a
+--- /dev/null
++++ b/test/deepseek/cases/01_basic_chat.json
+@@ -0,0 +1,8 @@
++{
++  "name": "基本多轮对话",
++  "input": [
++    {"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
++    {"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]},
++    {"type":"message","role":"user","content":[{"type":"input_text","text":"bye"}]}
++  ]
++}
+diff --git a/test/deepseek/cases/02_consecutive_assistant.json b/test/deepseek/cases/02_consecutive_assistant.json
+new file mode 100644
+index 00000000..8ffd5e1f
+--- /dev/null
++++ b/test/deepseek/cases/02_consecutive_assistant.json
+@@ -0,0 +1,9 @@
++{
++  "name": "连续assistant",
++  "input": [
++    {"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
++    {"type":"message","role":"assistant","content":[{"type":"output_text","text":"a"}]},
++    {"type":"message","role":"assistant","content":[{"type":"output_text","text":"b"}]},
++    {"type":"message","role":"user","content":[{"type":"input_text","text":"ok"}]}
++  ]
++}
+diff --git a/test/deepseek/cases/03_reasoning_tool.json b/test/deepseek/cases/03_reasoning_tool.json
+new file mode 100644
+index 00000000..fe19b466
+--- /dev/null
++++ b/test/deepseek/cases/03_reasoning_tool.json
+@@ -0,0 +1,10 @@
++{
++  "name": "reasoning + tool_call + tool_result",
++  "input": [
++    {"type":"message","role":"user","content":[{"type":"input_text","text":"list files"}]},
++    {"type":"reasoning","summary":[{"type":"summary_text","text":"need to list"}]},
++    {"type":"function_call","call_id":"c1","name":"ls","arguments":"{}"},
++    {"type":"function_call_output","call_id":"c1","output":"a.txt b.txt"},
++    {"type":"message","role":"user","content":[{"type":"input_text","text":"read a.txt"}]}
++  ]
++}
+diff --git a/test/deepseek/cases/04_multi_tool_call.json b/test/deepseek/cases/04_multi_tool_call.json
+new file mode 100644
+index 00000000..2e8ce3b3
+--- /dev/null
++++ b/test/deepseek/cases/04_multi_tool_call.json
+@@ -0,0 +1,13 @@
++{
++  "name": "多个连续function_call合并",
++  "input": [
++    {"type":"message","role":"user","content":[{"type":"input_text","text":"do 3 things"}]},
++    {"type":"function_call","call_id":"c1","name":"a","arguments":"{}"},
++    {"type":"function_call","call_id":"c2","name":"b","arguments":"{}"},
++    {"type":"function_call","call_id":"c3","name":"c","arguments":"{}"},
++    {"type":"function_call_output","call_id":"c1","output":"1"},
++    {"type":"function_call_output","call_id":"c2","output":"2"},
++    {"type":"function_call_output","call_id":"c3","output":"3"},
++    {"type":"message","role":"user","content":[{"type":"input_text","text":"done?"}]}
++  ]
++}
+diff --git a/test/deepseek/cases/05_assistant_then_tool.json b/test/deepseek/cases/05_assistant_then_tool.json
+new file mode 100644
+index 00000000..4752731d
+--- /dev/null
++++ b/test/deepseek/cases/05_assistant_then_tool.json
+@@ -0,0 +1,10 @@
++{
++  "name": "assistant text后接tool_call",
++  "input": [
++    {"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
++    {"type":"message","role":"assistant","content":[{"type":"output_text","text":"let me check"}]},
++    {"type":"function_call","call_id":"c1","name":"ls","arguments":"{}"},
++    {"type":"function_call_output","call_id":"c1","output":"ok"},
++    {"type":"message","role":"user","content":[{"type":"input_text","text":"next"}]}
++  ]
++}
+diff --git a/test/deepseek/cases/06_developer_between_tool.json b/test/deepseek/cases/06_developer_between_tool.json
+new file mode 100644
+index 00000000..7dc957d0
+--- /dev/null
++++ b/test/deepseek/cases/06_developer_between_tool.json
+@@ -0,0 +1,10 @@
++{
++  "name": "developer消息在tool_use和tool_result之间",
++  "input": [
++    {"type":"message","role":"user","content":[{"type":"input_text","text":"run cmd"}]},
++    {"type":"function_call","call_id":"c1","name":"exec","arguments":"{}"},
++    {"type":"message","role":"developer","content":[{"type":"input_text","text":"Approved command prefix saved"}]},
++    {"type":"function_call_output","call_id":"c1","output":"done"},
++    {"type":"message","role":"user","content":[{"type":"input_text","text":"next"}]}
++  ]
++}
+diff --git a/test/deepseek/cases/07_alternating_then_tool.json b/test/deepseek/cases/07_alternating_then_tool.json
+new file mode 100644
+index 00000000..d93bac88
+--- /dev/null
++++ b/test/deepseek/cases/07_alternating_then_tool.json
+@@ -0,0 +1,12 @@
++{
++  "name": "多轮交替后接tool",
++  "input": [
++    {"type":"message","role":"user","content":[{"type":"input_text","text":"q1"}]},
++    {"type":"message","role":"assistant","content":[{"type":"output_text","text":"a1"}]},
++    {"type":"message","role":"user","content":[{"type":"input_text","text":"q2"}]},
++    {"type":"message","role":"assistant","content":[{"type":"output_text","text":"a2"}]},
++    {"type":"function_call","call_id":"c1","name":"do","arguments":"{}"},
++    {"type":"function_call_output","call_id":"c1","output":"result"},
++    {"type":"message","role":"user","content":[{"type":"input_text","text":"q3"}]}
++  ]
++}
+diff --git a/test/deepseek/cases/08_codex_real_pattern.json b/test/deepseek/cases/08_codex_real_pattern.json
+new file mode 100644
+index 00000000..b5965247
+--- /dev/null
++++ b/test/deepseek/cases/08_codex_real_pattern.json
+@@ -0,0 +1,17 @@
++{
++  "name": "Codex真实模式：交替对话+中间tool+继续对话",
++  "input": [
++    {"type":"message","role":"user","content":[{"type":"input_text","text":"我说0你说1"}]},
++    {"type":"message","role":"assistant","content":[{"type":"output_text","text":"1"}]},
++    {"type":"message","role":"user","content":[{"type":"input_text","text":"我说2你echo3"}]},
++    {"type":"message","role":"assistant","content":[{"type":"output_text","text":"2"}]},
++    {"type":"function_call","call_id":"c1","name":"exec","arguments":"{\"cmd\":\"echo 3\"}"},
++    {"type":"function_call_output","call_id":"c1","output":"3"},
++    {"type":"message","role":"user","content":[{"type":"input_text","text":"我说4你输出5然后echo6再输出7"}]},
++    {"type":"message","role":"assistant","content":[{"type":"output_text","text":"5"}]},
++    {"type":"function_call","call_id":"c2","name":"exec","arguments":"{\"cmd\":\"echo 6\"}"},
++    {"type":"function_call_output","call_id":"c2","output":"6"},
++    {"type":"message","role":"assistant","content":[{"type":"output_text","text":"7"}]},
++    {"type":"message","role":"user","content":[{"type":"input_text","text":"done"}]}
++  ]
++}
+diff --git a/test/deepseek/cases/09_empty_reasoning.json b/test/deepseek/cases/09_empty_reasoning.json
+new file mode 100644
+index 00000000..a5142c8b
+--- /dev/null
++++ b/test/deepseek/cases/09_empty_reasoning.json
+@@ -0,0 +1,10 @@
++{
++  "name": "空reasoning（summary为空）",
++  "input": [
++    {"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
++    {"type":"reasoning","summary":[{"type":"summary_text","text":""}],"encrypted_content":""},
++    {"type":"function_call","call_id":"c1","name":"ls","arguments":"{}"},
++    {"type":"function_call_output","call_id":"c1","output":"files"},
++    {"type":"message","role":"user","content":[{"type":"input_text","text":"next"}]}
++  ]
++}
+diff --git a/test/deepseek/cases/10_multiple_rounds_with_tools.json b/test/deepseek/cases/10_multiple_rounds_with_tools.json
+new file mode 100644
+index 00000000..30d770cf
+--- /dev/null
++++ b/test/deepseek/cases/10_multiple_rounds_with_tools.json
+@@ -0,0 +1,18 @@
++{
++  "name": "多轮tool调用（Codex长对话模式）",
++  "input": [
++    {"type":"message","role":"user","content":[{"type":"input_text","text":"start"}]},
++    {"type":"reasoning","summary":[]},
++    {"type":"function_call","call_id":"c1","name":"read","arguments":"{}"},
++    {"type":"function_call_output","call_id":"c1","output":"content1"},
++    {"type":"message","role":"assistant","content":[{"type":"output_text","text":"got it"}]},
++    {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]},
++    {"type":"reasoning","summary":[{"type":"summary_text","text":"need more"}]},
++    {"type":"function_call","call_id":"c2","name":"read","arguments":"{}"},
++    {"type":"function_call","call_id":"c3","name":"read","arguments":"{}"},
++    {"type":"function_call_output","call_id":"c2","output":"content2"},
++    {"type":"function_call_output","call_id":"c3","output":"content3"},
++    {"type":"message","role":"assistant","content":[{"type":"output_text","text":"all done"}]},
++    {"type":"message","role":"user","content":[{"type":"input_text","text":"thanks"}]}
++  ]
++}
+diff --git a/test/deepseek/cases/11_consecutive_user.json b/test/deepseek/cases/11_consecutive_user.json
+new file mode 100644
+index 00000000..f4c0f67e
+--- /dev/null
++++ b/test/deepseek/cases/11_consecutive_user.json
+@@ -0,0 +1,9 @@
++{
++  "name": "连续user消息（正常情况）",
++  "input": [
++    {"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
++    {"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]},
++    {"type":"message","role":"assistant","content":[{"type":"output_text","text":"hey"}]},
++    {"type":"message","role":"user","content":[{"type":"input_text","text":"bye"}]}
++  ]
++}

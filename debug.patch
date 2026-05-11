@@ -36,7 +36,7 @@ index eb17864d..3cb47cb0 100644
  			if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
  				reporter.Publish(ctx, detail)
 diff --git a/internal/translator/claude/openai/responses/claude_openai-responses_request.go b/internal/translator/claude/openai/responses/claude_openai-responses_request.go
-index fb79a5bb..ee4dbba0 100644
+index 59478cbd..d6d9daf0 100644
 --- a/internal/translator/claude/openai/responses/claude_openai-responses_request.go
 +++ b/internal/translator/claude/openai/responses/claude_openai-responses_request.go
 @@ -6,6 +6,7 @@ import (
@@ -55,14 +55,13 @@ index fb79a5bb..ee4dbba0 100644
  
  	if account == "" {
  		u, _ := uuid.NewRandom()
-@@ -472,6 +474,27 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
+@@ -436,6 +438,26 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
  		}
  	}
  
-+	// Debug
-+	var dbg []byte
 +	msgsD := gjson.GetBytes(out, "messages")
 +	if msgsD.IsArray() {
++		var dbg []byte
 +		dbg = append(dbg, []byte(fmt.Sprintf("total_messages:%d\n", len(msgsD.Array())))...)
 +		for i, m := range msgsD.Array() {
 +			role := m.Get("role").String()
@@ -70,15 +69,15 @@ index fb79a5bb..ee4dbba0 100644
 +			m.Get("content").ForEach(func(_, cc gjson.Result) bool { types = append(types, cc.Get("type").String()); return true })
 +			dbg = append(dbg, []byte(fmt.Sprintf("  [%d] role=%s types=%v\n", i, role, types))...)
 +		}
++		_ = os.WriteFile("/Users/hanger/.codex-proxy/debug/msg-order.log", dbg, 0644)
++		var hashes []byte
++		msgsD.ForEach(func(idx gjson.Result, m gjson.Result) bool {
++			h := fmt.Sprintf("%x", sha256.Sum256([]byte(m.Raw)))[:12]
++			hashes = append(hashes, []byte(fmt.Sprintf("%d %s\n", idx.Int(), h))...)
++			return true
++		})
++		_ = os.WriteFile("/Users/hanger/.codex-proxy/debug/msg-hashes.txt", hashes, 0644)
 +	}
-+	_ = os.WriteFile("/Users/hanger/.codex-proxy/debug/msg-order.log", dbg, 0644)
-+	var hashes []byte
-+	msgsD.ForEach(func(idx gjson.Result, m gjson.Result) bool {
-+		h := fmt.Sprintf("%x", sha256.Sum256([]byte(m.Raw)))[:12]
-+		hashes = append(hashes, []byte(fmt.Sprintf("%d %s\n", idx.Int(), h))...)
-+		return true
-+	})
-+	_ = os.WriteFile("/Users/hanger/.codex-proxy/debug/msg-hashes.txt", hashes, 0644)
 +
  	return out
  }
